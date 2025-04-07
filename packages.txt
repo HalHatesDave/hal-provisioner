@@ -1,0 +1,79 @@
+# System & Basics
+build-essential
+curl
+wget
+git
+htop
+tree
+jq
+unzip
+zip
+ncdu
+tmux
+zsh
+neofetch
+software-properties-common
+apt-transport-https
+ca-certificates
+gnupg-agent
+
+# Networking & Security
+net-tools
+nmap
+tcpdump
+ufw
+fail2ban
+openssh-server
+openssl
+
+# Cloud & DevOps
+azure-cli
+awscli
+google-cloud-sdk
+terraform
+ansible
+kubectl
+helm
+docker.io
+docker-compose
+podman
+containerd
+
+# Languages & Runtimes
+python3
+python3-pip
+python3-venv
+nodejs
+npm
+default-jdk
+golang
+ruby
+rustc
+cargo
+
+# Editors & IDEs
+vim
+neovim
+emacs
+nano
+code
+
+# Database Tools
+postgresql-client
+mysql-client
+sqlite3
+mongodb-clients
+redis-tools
+
+# Monitoring & Logging
+sysstat
+dstat
+logrotate
+lsof
+strace
+
+# Miscellaneous
+ffmpeg
+imagemagick
+libreoffice
+pdftk
