@@ -1,61 +1,288 @@
 #!/usr/bin/env bash
 ################################################################################################################################
-### hal-provisoner v2: a Multi-Cloud VM Provisioner (Azure/AWS/GCP)
+### hal-provisioner v3.1: a Multi-Cloud VM Provisioner (Azure/AWS/GCP)
 ################################################################################################################################
 echo -e "\n\033[1;33m
- /\\_/\\   ██╗  ██╗ █████╗ ██╗         /\\_/\\
+/\\_/\\   ██╗  ██╗ █████╗ ██╗         /\\_/\\
 ( o.o )  ██║  ██║██╔══██╗██║        ( o.o )
- > ^ <   ███████║███████║██║         > ^ <
- /\\_/\\   ██╔══██║██╔══██║██║         /\\_/\\
+> ^ <   ███████║███████║██║         > ^ <
+/\\_/\\   ██╔══██║██╔══██║██║         /\\_/\\
 ( o.o )  ██║  ██║██║  ██║███████╗   ( o.o )
- > ^ <   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝    > ^ <
+> ^ <   ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝    > ^ <
 \033[0m"
 echo "hal-provisioner v2.0 now running..."
 sleep 1
 ################################################################################################################################
 set -eo pipefail
 ################################################################################################################################
-### Config
-CLOUD="azure"
-VM_NAME="devbox01"
-REGION="eastus"
+### Cloud Provider Selection
+select_cloud_provider() {
+  echo "Select cloud provider:"
+  echo "1) Azure"
+  echo "2) AWS"
+  echo "3) GCP"
+  read -p "Enter choice (1-3) [1]: " CLOUD_CHOICE
+  CLOUD_CHOICE=${CLOUD_CHOICE:-1}
+
+  case "$CLOUD_CHOICE" in
+    1) CLOUD="azure" ;;
+    2) CLOUD="aws" ;;
+    3) CLOUD="gcp" ;;
+    *) echo "Invalid choice. Using Azure by default."; CLOUD="azure" ;;
+  esac
+
+  echo "Selected cloud provider: $CLOUD"
+}
+################################################################################################################################
+### Interactive Configuration
+################################################################################################################################
+get_vm_config() {
+  # Default values based on cloud provider
+  case "$CLOUD" in
+    azure)
+      DEFAULT_VM_NAME="devbox01"
+      DEFAULT_REGION="eastus"
+      DEFAULT_IMAGE="Ubuntu2204"
+      DEFAULT_SIZE="Standard_B1s"
+      ;;
+    aws)
+      DEFAULT_VM_NAME="devbox01"
+      DEFAULT_REGION="us-east-1"
+      DEFAULT_IMAGE="ami-0c55b159cbfafe1f0"  # Ubuntu 22.04 LTS
+      DEFAULT_SIZE="t3.small"
+      ;;
+    gcp)
+      DEFAULT_VM_NAME="devbox01"
+      DEFAULT_REGION="us-central1"
+      DEFAULT_IMAGE="ubuntu-2204-lts"
+      DEFAULT_SIZE="e2-small"
+      ;;
+  esac
+
+  # Get VM Name
+  read -p "Name of the VM [$DEFAULT_VM_NAME]: " VM_NAME
+  VM_NAME=${VM_NAME:-$DEFAULT_VM_NAME}
+
+  # Get Region...
+  while true; do
+    read -p "Region to deploy VM [$DEFAULT_REGION]: " REGION
+    REGION=${REGION:-$DEFAULT_REGION}
+
+    # Basic validation - check if region is non-empty
+    if [[ -z "$REGION" ]]; then
+      echo "Error: Region cannot be empty. Please try again."
+      continue
+    fi
+
+    # ...and validate
+    case "$CLOUD" in
+      azure)
+        if ! az account list-locations --query "[].name" -o tsv | grep -q "^$REGION$"; then
+          echo "Error: Invalid Azure region. Please try again."
+          continue
+        fi
+        ;;
+      aws)
+        if ! aws ec2 describe-regions --region-names "$REGION" --query "Regions[0].RegionName" --output text &>/dev/null; then
+          echo "Error: Invalid AWS region. Please try again."
+          continue
+        fi
+        ;;
+      gcp)
+        if ! gcloud compute regions list --filter="name=$REGION" --format="value(name)" | grep -q "^$REGION$"; then
+          echo "Error: Invalid GCP region. Please try again."
+          continue
+        fi
+        ;;
+    esac
+    break
+  done
+
+  # Get desired image...
+  while true; do
+    case "$CLOUD" in
+      azure)
+        echo "Image for VM (e.g., 'Ubuntu2204', 'Canonical:UbuntuServer:18.04-LTS:latest') [$DEFAULT_IMAGE]: "
+        ;;
+      aws)
+        echo "Image for VM (must be an AMI ID like 'ami-0c55b159cbfafe1f0' or name like 'ubuntu/images/hvm-ssd/ubuntu-jammy-22.04-amd64-server-*') [$DEFAULT_IMAGE]: "
+        ;;
+      gcp)
+        echo "Image for VM (e.g., 'ubuntu-2204-lts', 'debian-11') [$DEFAULT_IMAGE]: "
+        ;;
+      *)
+        echo "Image for VM [$DEFAULT_IMAGE]: "
+        ;;
+    esac
+
+    read -p "> " IMAGE
+    IMAGE=${IMAGE:-$DEFAULT_IMAGE}
+
+    if [[ -z "$IMAGE" ]]; then
+      echo "Error: Image cannot be empty. Please try again."
+      continue
+    fi
+
+    # ...and validate with cloud provider
+    case "$CLOUD" in
+      azure)
+        if ! az vm image list --all --location "$REGION" --query "[?contains(urn, '$IMAGE')].urn" -o tsv | grep -q .; then
+          echo "Error: Image not found in Azure region $REGION. Please try again."
+          echo "Tip: Try 'az vm image list --output table --location $REGION' to see available images"
+          continue
+        fi
+        ;;
+      aws)
+        if [[ "$IMAGE" == ami-* ]]; then
+          if ! aws ec2 describe-images --image-ids "$IMAGE" --region "$REGION" &>/dev/null; then
+            echo "Error: AMI not found in AWS region $REGION. Please try again."
+            echo "Tip: Try 'aws ec2 describe-images --owners amazon --region $REGION' to see available AMIs"
+            continue
+          fi
+        else
+          echo "Note: Searching for AMIs matching '$IMAGE'. For production use, specify exact AMI ID."
+          # Don't validate name patterns immediately - we'll handle the search in create_vm_aws()
+        fi
+        ;;
+      gcp)
+        if ! gcloud compute images list --filter="name~'$IMAGE'" --format="value(name)" | grep -q .; then
+          echo "Error: Image not found in GCP. Please try again."
+          echo "Tip: Try 'gcloud compute images list' to see available images"
+          continue
+        fi
+        ;;
+    esac
+    break
+  done
+
+  # Get VM Size...
+  while true; do
+    read -p "Size of VM [$DEFAULT_SIZE]: " SIZE
+    SIZE=${SIZE:-$DEFAULT_SIZE}
+
+    if [[ -z "$SIZE" ]]; then
+      echo "Error: Size cannot be empty. Please try again."
+      continue
+    fi
+
+    # ...and validate based on cloud provider
+    case "$CLOUD" in
+      azure)
+        if ! az vm list-sizes --location "$REGION" --query "[?name=='$SIZE'].name" -o tsv | grep -q "^$SIZE$"; then
+          echo "Error: Invalid VM size for Azure region $REGION. Please try again."
+          continue
+        fi
+        ;;
+      aws)
+        if ! aws ec2 describe-instance-types --instance-types "$SIZE" --region "$REGION" &>/dev/null; then
+          echo "Error: Invalid instance type for AWS region $REGION. Please try again."
+          continue
+        fi
+        AWS_INSTANCE_TYPE="$SIZE"
+        ;;
+      gcp)
+        if ! gcloud compute machine-types list --filter="name=$SIZE AND zone:$REGION" --format="value(name)" | grep -q "^$SIZE$"; then
+          echo "Error: Invalid machine type for GCP region $REGION. Please try again."
+          continue
+        fi
+        GCP_MACHINE_TYPE="$SIZE"
+        ;;
+    esac
+    break
+  done
+
+  # Get Admin Username
+  read -p "Admin username [adminuser]: " ADMIN_USER
+  ADMIN_USER=${ADMIN_USER:-"adminuser"}
+
+  # Get SSH Key Path
+  read -p "SSH public key path [$HOME/.ssh/id_rsa.pub]: " SSH_KEY
+  SSH_KEY=${SSH_KEY:-"$HOME/.ssh/id_rsa.pub"}
+
+  # Get SSH Port
+  while true; do
+    read -p "SSH port [22]: " SSH_PORT
+    SSH_PORT=${SSH_PORT:-22}
+
+    if ! [[ "$SSH_PORT" =~ ^[0-9]+$ ]] || [[ "$SSH_PORT" -lt 1 || "$SSH_PORT" -gt 65535 ]]; then
+      echo "Error: Invalid SSH port. Must be between 1 and 65535."
+      continue
+    fi
+    break
+  done
+
+  # Get Security Hardening preference
+  read -p "Enable security hardening? (y/n) [y]: " HARDEN_CHOICE
+  HARDEN_CHOICE=${HARDEN_CHOICE:-y}
+  if [[ "$HARDEN_CHOICE" =~ ^[Yy]$ ]]; then
+    SECURITY_HARDENING=true
+  else
+    SECURITY_HARDENING=false
+  fi
+
+  # Get Package File
+  read -p "Package list file (leave empty to skip) [packages.txt]: " PACKAGE_FILE
+  PACKAGE_FILE=${PACKAGE_FILE:-"packages.txt"}
+}
+################################################################################################################################
+### Variable Storage Land
+################################################################################################################################
+CLOUD=""
+VM_NAME=""
+REGION=""
 ADMIN_USER="adminuser"
 SSH_KEY="$HOME/.ssh/id_rsa.pub"
-IMAGE="Ubuntu2204"
-SIZE="Standard_B1s"  # Azure
-AWS_INSTANCE_TYPE="t3.small"  # AWS
-GCP_MACHINE_TYPE="e2-small"  # GCP
+IMAGE=""
+SIZE=""
+AWS_INSTANCE_TYPE=""
+GCP_MACHINE_TYPE=""
 RESOURCE_GROUP="provision-rg"
 PACKAGE_FILE="packages.txt"
 TAGS="Environment=Dev,Owner=Admin"
 SECURITY_HARDENING=true
-SSH_PORT=22  # Default SSH port
-SSH_CIDR="$(curl -s --fail --connect-timeout 3 ifconfig.me || echo "0.0.0.0")/32"  # Current IP with fallback
+SSH_PORT=22
+SSH_CIDR="$(curl -s --fail --connect-timeout 3 ifconfig.me || echo "0.0.0.0")/32"
 ################################################################################################################################
-### Usage // Help
+### Usage / Help Text
+################################################################################################################################
 usage() {
-  echo "Usage: $0 --cloud <azure|aws|gcp> [options]"
+  echo "Usage: $0 [options]"
   echo "Options:"
-  echo "  --cloud <provider>    Cloud provider (azure/aws/gcp)"
-  echo "  --name <vm-name>      VM name (default: devbox01)"
-  echo "  --region <region>     Region (default: eastus/us-east-1)"
-  echo "  --user <username>     Admin username (default: adminuser)"
-  echo "  --ssh-key <path>      SSH public key path (default: ~/.ssh/id_rsa.pub)"
-  echo "  --ssh-port <port>     Custom SSH port (default: 22)"
-  echo "  --ssh-cidr <cidr>     Allowed SSH CIDR (default: your public IP)"
-  echo "  --packages <file>     Package list file (default: packages.txt)"
-  echo "  --no-hardening       Skip security hardening"
-  echo "  --help               Show this help"
+  echo "  --non-interactive    Run in non-interactive mode (requires all parameters set)"
+  echo "  --cloud <provider>   Cloud provider (azure/aws/gcp)"
+  echo "  --name <vm-name>     VM name"
+  echo "  --region <region>    Region"
+  echo "  --user <username>    Admin username"
+  echo "  --ssh-key <path>     SSH public key path"
+  echo "  --ssh-port <port>    Custom SSH port"
+  echo "  --ssh-cidr <cidr>    Allowed SSH CIDR"
+  echo "  --packages <file>    Package list file"
+  echo "  --no-hardening      Skip security hardening"
+  echo "  --help              Show this help"
   exit 0
 }
+
 ################################################################################################################################
-### Validation
+### Basic Validation
+################################################################################################################################
 validate_inputs() {
   # Validate cloud provider
   case "$CLOUD" in
     azure|aws|gcp) ;;
     *) echo "[-] Invalid cloud provider. Use: azure, aws, gcp"; exit 1 ;;
   esac
+
+  # Validate VM name
+  if [[ -z "$VM_NAME" ]]; then
+    echo "[-] VM name cannot be empty"
+    exit 1
+  fi
+
+  # Validate region
+  if [[ -z "$REGION" ]]; then
+    echo "[-] Region cannot be empty"
+    exit 1
+  fi
 
   # Validate SSH key
   if [[ ! -f "$SSH_KEY" ]]; then
@@ -84,6 +311,7 @@ validate_inputs() {
 
 ################################################################################################################################
 ### CLI Tool Checker
+################################################################################################################################
 check_cli() {
   case "$CLOUD" in
     azure)
@@ -103,6 +331,7 @@ check_cli() {
 
 ################################################################################################################################
 ### Cleanup Functions for Error Handling
+################################################################################################################################
 cleanup_azure() {
   echo "[!] Cleaning up Azure resources..."
   az group delete --name "$RESOURCE_GROUP" --yes --no-wait || true
@@ -136,7 +365,7 @@ cleanup_gcp() {
 ################################################################################################################################
 ### Provisioner Functions
 ################################################################################################################################
-# Azure VM Provisioning
+# Azure
 create_vm_azure() {
   echo "[+] Provisioning Azure VM..."
 
@@ -174,8 +403,8 @@ create_vm_azure() {
 
   PUBLIC_IP=$(az vm show -d -g "$RESOURCE_GROUP" -n "$VM_NAME" --query publicIps -o tsv)
 }
-
-# AWS VM Provisioning
+################################################################################################################################
+# AWS
 create_vm_aws() {
   echo "[+] Provisioning AWS EC2 instance..."
   AWS_KEY_NAME="aws-key-${VM_NAME}-$(date +%s)"
@@ -196,8 +425,55 @@ create_vm_aws() {
     --port "$SSH_PORT" \
     --cidr "$SSH_CIDR"
 
-  # Get Ubuntu 22.04 AMI
-  AMI_ID=$(aws ssm get-parameter --name /aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id --query "Parameter.Value" --output text)
+  # Determine AMI ID based on user input
+  if [[ "$IMAGE" == ami-* ]]; then
+    # User provided a direct AMI ID
+    AMI_ID="$IMAGE"
+    echo "[+] Using user-specified AMI: $AMI_ID"
+
+    # Verify the AMI exists in this region
+    if ! aws ec2 describe-images --image-ids "$AMI_ID" --region "$REGION" >/dev/null 2>&1; then
+      echo "[-] Error: AMI $AMI_ID not found in region $REGION"
+      cleanup_aws
+      exit 1
+    fi
+  else
+    # Try to find a matching AMI
+    echo "[+] Searching for AMI matching: $IMAGE"
+
+    # First try Ubuntu canonical
+    AMI_ID=$(aws ec2 describe-images \
+      --owners 099720109477 \
+      --filters "Name=name,Values=*$IMAGE*" \
+                "Name=architecture,Values=x86_64" \
+                "Name=root-device-type,Values=ebs" \
+                "Name=virtualization-type,Values=hvm" \
+      --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+      --output text \
+      --region "$REGION")
+
+    # If not found, try community AMIs
+    if [[ -z "$AMI_ID" ]]; then
+      AMI_ID=$(aws ec2 describe-images \
+        --executable-users all \
+        --filters "Name=name,Values=*$IMAGE*" \
+                  "Name=architecture,Values=x86_64" \
+                  "Name=root-device-type,Values=ebs" \
+                  "Name=virtualization-type,Values=hvm" \
+        --query "sort_by(Images, &CreationDate)[-1].ImageId" \
+        --output text \
+        --region "$REGION")
+    fi
+
+    if [[ -z "$AMI_ID" ]]; then
+      echo "[-] Error: Could not find AMI matching '$IMAGE' in region $REGION"
+      echo "[!] Try specifying the exact AMI ID (ami-xxxxxxxx) instead"
+      cleanup_aws
+      exit 1
+    fi
+
+    echo "[+] Found matching AMI: $AMI_ID"
+  fi
 
   # Launch instance
   INSTANCE_ID=$(aws ec2 run-instances \
@@ -214,8 +490,8 @@ create_vm_aws() {
 
   PUBLIC_IP=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" --query "Reservations[0].Instances[0].PublicIpAddress" --output text)
 }
-
-# GCP VM Provisioning
+################################################################################################################################
+# Google Cloud
 create_vm_gcp() {
   echo "[+] Provisioning GCP VM..."
   GCP_PROJECT=$(gcloud config get-value project)
@@ -384,7 +660,8 @@ install_packages() {
 }
 
 ################################################################################################################################
-### Wait for SSH to be available
+### SSH Waiter
+################################################################################################################################
 wait_for_ssh() {
   echo "[+] Waiting for SSH to be available on port $SSH_PORT..."
   local max_attempts=30
@@ -409,22 +686,36 @@ wait_for_ssh() {
 ### Main
 ################################################################################################################################
 main() {
-  # Parse args
-  while [[ "$#" -gt 0 ]]; do
-    case $1 in
-      --cloud) CLOUD="$2"; shift 2 ;;
-      --name) VM_NAME="$2"; shift 2 ;;
-      --region) REGION="$2"; shift 2 ;;
-      --user) ADMIN_USER="$2"; shift 2 ;;
-      --ssh-key) SSH_KEY="$2"; shift 2 ;;
-      --ssh-port) SSH_PORT="$2"; shift 2 ;;
-      --ssh-cidr) SSH_CIDR="$2"; shift 2 ;;
-      --packages) PACKAGE_FILE="$2"; shift 2 ;;
-      --no-hardening) SECURITY_HARDENING=false; shift ;;
+  # Check for non-interactive mode
+  NON_INTERACTIVE=false
+  for arg in "$@"; do
+    case $arg in
+      --non-interactive) NON_INTERACTIVE=true; shift ;;
       --help) usage ;;
-      *) echo "Unknown argument: $1"; exit 1 ;;
     esac
   done
+
+  if [[ "$NON_INTERACTIVE" == "true" ]]; then
+    # Parse args for non-interactive mode
+    while [[ "$#" -gt 0 ]]; do
+      case $1 in
+        --cloud) CLOUD="$2"; shift 2 ;;
+        --name) VM_NAME="$2"; shift 2 ;;
+        --region) REGION="$2"; shift 2 ;;
+        --user) ADMIN_USER="$2"; shift 2 ;;
+        --ssh-key) SSH_KEY="$2"; shift 2 ;;
+        --ssh-port) SSH_PORT="$2"; shift 2 ;;
+        --ssh-cidr) SSH_CIDR="$2"; shift 2 ;;
+        --packages) PACKAGE_FILE="$2"; shift 2 ;;
+        --no-hardening) SECURITY_HARDENING=false; shift ;;
+        *) echo "Unknown argument: $1"; exit 1 ;;
+      esac
+    done
+  else
+    # Interactive mode
+    select_cloud_provider
+    get_vm_config
+  fi
 
   validate_inputs
   check_cli
